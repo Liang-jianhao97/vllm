@@ -122,6 +122,8 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    enable_grouped_scale_fast_path: tl.constexpr,
+    enable_int4_fp16_dequant: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -230,6 +232,27 @@ def fused_moe_kernel_gptq_awq(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # For int4 w4a16 without zero-points, scales are shared across `group_size`
+    # consecutive K elements. Loading a full [BLOCK_SIZE_K, BLOCK_SIZE_N] scale
+    # tile causes repeated loads of identical values. When BLOCK_SIZE_K is a
+    # multiple of group_size, process one group at a time and load a [1, N]
+    # scale row per group, then broadcast it for dequant.
+    use_grouped_scale_fast_path = (
+        enable_grouped_scale_fast_path
+        and use_int4_w4a16
+        and not has_zp
+        and block_k_diviable
+        and (group_size % 2 == 0)
+        and (BLOCK_SIZE_K % group_size == 0)
+    )
+    offs_kg = tl.arange(0, group_size)
+    packed_kg = offs_kg // 2
+    b_shifter_kg = (offs_kg[:, None] % 2) * 4
+    groups_per_block = BLOCK_SIZE_K // group_size
+    packed_group_stride = group_size // 2
+    a_base_ptrs = a_ptr + (offs_token[:, None] // top_k) * stride_am
+    b_base_ptrs = b_ptr + off_experts * stride_be + offs_bn[None, :] * stride_bn
+
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -241,52 +264,97 @@ def fused_moe_kernel_gptq_awq(
             k_mask = None
             k_other = None
 
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(b_ptrs)
-        if use_int4_w4a16:
-            b = (b >> b_shifter) & 0xF
-
-        b_scale_ptrs = (
-            b_scale_ptr
-            + off_experts * stride_bse
-            + offs_bn[None, :] * stride_bsn
-            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
-        )
-        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        b_scale = b_scale.to(tl.float32)
-
-        if has_zp and use_int4_w4a16:
-            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
-            b_zp_ptrs = (
-                b_zp_ptr
-                + off_experts * stride_bze
-                + (offs_bn[None, :] // 2) * stride_bzn
-                + offs_k_true * stride_bzk
+        if use_grouped_scale_fast_path:
+            b_scale_base_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn * stride_bsn
+                + (k * groups_per_block) * stride_bsk
             )
-            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
-            b_zp = (b_zp >> b_zp_shifter) & 0xF
-            b_zp = b_zp.to(tl.float32)
-        elif has_zp and use_int8_w8a16:
-            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
-            b_zp_ptrs = (
-                b_zp_ptr
-                + off_experts * stride_bze
-                + offs_bn[None, :] * stride_bzn
-                + offs_k_true * stride_bzk
-            )
-            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
-            b_zp = b_zp.to(tl.float32)
+            k_start = k * BLOCK_SIZE_K
+            packed_k_start = k_start // 2
+            for kg in range(0, groups_per_block):
+                offs_k_chunk = k_start + kg * group_size + offs_kg
 
-        # We accumulate along the K dimension.
-        if has_zp:
-            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+                a_chunk_ptrs = a_base_ptrs + offs_k_chunk[None, :] * stride_ak
+                a_chunk = tl.load(a_chunk_ptrs, mask=token_mask[:, None], other=0.0)
+
+                packed_k_offsets = packed_k_start + kg * packed_group_stride + packed_kg
+                b_chunk_ptrs = b_base_ptrs + packed_k_offsets[:, None] * stride_bk
+                b_chunk = tl.load(b_chunk_ptrs)
+                b_chunk = (b_chunk >> b_shifter_kg) & 0xF
+
+                b_scale_row_ptrs = b_scale_base_ptrs + kg * stride_bsk
+                if enable_int4_fp16_dequant:
+                    b_scale_row = tl.load(b_scale_row_ptrs).to(tl.float16)
+                    b_chunk = (
+                        (b_chunk.to(tl.float16) - b_zp_num) * b_scale_row[None, :]
+                    ).to(compute_type)
+                else:
+                    b_scale_row = tl.load(b_scale_row_ptrs).to(tl.float32)
+                    b_chunk = (
+                        (b_chunk.to(tl.float32) - b_zp_num) * b_scale_row[None, :]
+                    ).to(compute_type)
+                accumulator = tl.dot(a_chunk, b_chunk, acc=accumulator)
         else:
-            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-        accumulator = tl.dot(a, b, acc=accumulator)
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs)
+            if use_int4_w4a16:
+                b = (b >> b_shifter) & 0xF
+
+            b_scale_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn[None, :] * stride_bsn
+                + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+            )
+            b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+            if enable_int4_fp16_dequant and use_int4_w4a16:
+                b_scale = b_scale.to(tl.float16)
+            else:
+                b_scale = b_scale.to(tl.float32)
+
+            if has_zp and use_int4_w4a16:
+                offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+                b_zp_ptrs = (
+                    b_zp_ptr
+                    + off_experts * stride_bze
+                    + (offs_bn[None, :] // 2) * stride_bzn
+                    + offs_k_true * stride_bzk
+                )
+                b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+                b_zp = (b_zp >> b_zp_shifter) & 0xF
+                if enable_int4_fp16_dequant:
+                    b_zp = b_zp.to(tl.float16)
+                else:
+                    b_zp = b_zp.to(tl.float32)
+            elif has_zp and use_int8_w8a16:
+                offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+                b_zp_ptrs = (
+                    b_zp_ptr
+                    + off_experts * stride_bze
+                    + offs_bn[None, :] * stride_bzn
+                    + offs_k_true * stride_bzk
+                )
+                b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+                b_zp = b_zp.to(tl.float32)
+
+            # We accumulate along the K dimension.
+            if has_zp:
+                if enable_int4_fp16_dequant and use_int4_w4a16:
+                    b = ((b.to(tl.float16) - b_zp) * b_scale).to(compute_type)
+                else:
+                    b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            else:
+                if enable_int4_fp16_dequant and use_int4_w4a16:
+                    b = ((b.to(tl.float16) - b_zp_num) * b_scale).to(compute_type)
+                else:
+                    b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+            accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -682,6 +750,12 @@ def invoke_fused_moe_wna16_triton_kernel(
             block_size_m=config["BLOCK_SIZE_M"],
         )
     )
+    enable_grouped_scale_fast_path = os.getenv(
+        "VLLM_MOE_INT4_GROUPED_SCALE_FAST_PATH", "1"
+    ).lower() in ("1", "true", "yes", "on")
+    enable_int4_fp16_dequant = os.getenv(
+        "VLLM_MOE_INT4_DEQUANT_FP16", "0"
+    ).lower() in ("1", "true", "yes", "on")
 
     fused_moe_kernel_gptq_awq[grid](
         A,
@@ -718,6 +792,8 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        enable_grouped_scale_fast_path=enable_grouped_scale_fast_path,
+        enable_int4_fp16_dequant=enable_int4_fp16_dequant,
         **config,
     )
 
