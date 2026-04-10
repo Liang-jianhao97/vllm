@@ -53,6 +53,25 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+except ImportError:
+    # Keep fallback objects for compatibility with environments where
+    # triton.experimental.gluon is unavailable.
+    gluon = triton
+    gl = tl
+
+_HAS_GLUON_W4A16 = bool(
+    gluon is not None
+    and gl is not None
+    and hasattr(gl, "BlockedLayout")
+    and hasattr(gl, "amd")
+)
+
+
+# Gluon kernels are defined next to corresponding Triton kernels below.
+
 
 @triton.jit
 def write_zeros_to_output(
@@ -640,6 +659,388 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+if _HAS_GLUON_W4A16:
+
+    @gluon.jit
+    def write_zeros_to_output_gluon(
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        pid_n,
+        pid_m,
+        N,
+        sorted_token_ids_ptr,
+        num_valid_tokens,
+        BLOCK_SIZE_M: gl.constexpr,
+        BLOCK_SIZE_N: gl.constexpr,
+        compute_type: gl.constexpr,
+    ):
+        blocked_c: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 1],
+            threads_per_warp=[16, 2],
+            warps_per_cta=[1, 2],
+            order=[1, 0],
+        )
+        offs_token_id = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_c)).to(gl.int64)
+        offs_token = gl.load(sorted_token_ids_ptr + offs_token_id).to(gl.int64)
+        token_mask = offs_token < num_valid_tokens
+        accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type, layout=blocked_c)
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_c))
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        gl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+    @gluon.jit
+    def fused_moe_kernel_gptq_awq_gluon(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        b_scale_ptr,
+        b_zp_ptr,
+        topk_weights_ptr,
+        sorted_token_ids_ptr,
+        expert_ids_ptr,
+        num_tokens_post_padded_ptr,
+        N: gl.constexpr,
+        K: gl.constexpr,
+        EM,
+        num_valid_tokens,
+        stride_am,
+        stride_ak,
+        stride_be,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        stride_bse,
+        stride_bsk,
+        stride_bsn,
+        stride_bze,
+        stride_bzk,
+        stride_bzn,
+        block_k_diviable: gl.constexpr,
+        group_size: gl.constexpr,
+        BLOCK_SIZE_M: gl.constexpr,
+        BLOCK_SIZE_N: gl.constexpr,
+        BLOCK_SIZE_K: gl.constexpr,
+        GROUP_SIZE_M: gl.constexpr,
+        SPLIT_K: gl.constexpr,
+        MUL_ROUTED_WEIGHT: gl.constexpr,
+        top_k: gl.constexpr,
+        compute_type: gl.constexpr,
+        has_zp: gl.constexpr,
+        use_int4_w4a16: gl.constexpr,
+        use_int8_w8a16: gl.constexpr,
+        enable_grouped_scale_fast_path: gl.constexpr,
+        enable_int4_fp16_dequant: gl.constexpr,
+    ):
+        PACK_B : gl.constexpr = 2
+
+        blocked_a: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[2, 16],
+            warps_per_cta=[2, 1],
+            order=[1, 0],
+        )
+
+        blocked_b: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[8, 1],
+            threads_per_warp=[1, 32],
+            warps_per_cta=[1, 2],
+            order=[0, 1],
+        )
+
+        blocked_bs: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 1],
+            threads_per_warp=[1, 32],
+            warps_per_cta=[1, 2],
+            order=[0, 1],
+        )
+
+        wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+           version=1, transposed=True,
+           warp_bases=[[0, 1]],
+           instr_shape=[16, 16, 16], rank=2,
+        )
+
+        a_wmma_layout: gl.constexpr = gl.DotOperandLayout(0, wmma_layout, 8)
+        b_wmma_layout: gl.constexpr = gl.DotOperandLayout(1, wmma_layout, 8)
+        b_int8_wmma_layout: gl.constexpr = gl.DotOperandLayout(1, wmma_layout, 8)
+
+        shared_a: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=8, per_phase=1, max_phase=8, order=[1, 0]
+        )
+
+        shared_b: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=8, per_phase=2, max_phase=8, order=[0, 1]
+        )
+
+        smem_a = gl.allocate_shared_memory(
+            a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
+        )
+
+        smem_b_int8 = gl.allocate_shared_memory(
+            b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
+        )
+
+        pid = gl.program_id(axis=0)
+        num_pid_m = gl.cdiv(EM, BLOCK_SIZE_M)
+        num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+        num_tokens_post_padded = gl.load(num_tokens_post_padded_ptr)
+        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+            return
+
+        offs_token_id = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M).to(gl.int64)
+        offs_token = gl.load(sorted_token_ids_ptr + offs_token_id).to(gl.int64)
+        token_mask = offs_token < num_valid_tokens
+
+        offs_token_id_a = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_a)).to(gl.int64)
+        offs_token_a = gl.load(sorted_token_ids_ptr + offs_token_id_a).to(gl.int64)
+        token_mask_a = offs_token_a < num_valid_tokens
+
+        off_experts = gl.load(expert_ids_ptr + pid_m).to(gl.int64)
+        if off_experts == -1:
+            write_zeros_to_output_gluon(
+                c_ptr,
+                stride_cm,
+                stride_cn,
+                pid_n,
+                pid_m,
+                N,
+                sorted_token_ids_ptr,
+                num_valid_tokens,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                compute_type=compute_type,
+            )
+            return
+
+        offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_a))
+        a_ptrs = a_ptr + (
+            offs_token_a[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak
+        )
+
+        offs_bn = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_b)).to(gl.int64)) % N
+        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_b))
+
+        if use_int4_w4a16:
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + (offs_bk[:, None] // PACK_B) * stride_bk
+                + offs_bn[None, :] * stride_bn
+            )
+            b_shifter = ((offs_bk[:, None] % 2) * 4).to(gl.int8)
+        elif use_int8_w8a16:
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + offs_k[:, None] * stride_bk
+                + offs_bn[None, :] * stride_bn
+            )
+
+        offs_bsk = gl.arange(0, BLOCK_SIZE_K // group_size, layout=gl.SliceLayout(1, blocked_bs))
+        offs_bsn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_bs))
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bsn[None, :] * stride_bsn
+            + (offs_bsk[:, None]) * stride_bsk
+        )
+
+        if not has_zp and use_int4_w4a16:
+            b_zp_num = 8
+        if not has_zp and use_int8_w8a16:
+            b_zp_num = 128
+        elif has_zp and use_int4_w4a16:
+            b_zp_shifter = (offs_bn[None, :] % 2) * 4
+
+        ############################################################################
+        # accumulator
+        ############################################################################
+
+        accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_layout)
+
+        # use_grouped_scale_fast_path = (
+        #     enable_grouped_scale_fast_path
+        #     and use_int4_w4a16
+        #     and not has_zp
+        #     and block_k_diviable
+        #     and (group_size % 2 == 0)
+        #     and (BLOCK_SIZE_K % group_size == 0)
+        # )
+        # offs_kg = gl.arange(0, group_size)
+        # packed_kg = offs_kg // 2
+        # b_shifter_kg = (offs_kg[:, None] % 2) * 4
+        # groups_per_block = BLOCK_SIZE_K // group_size
+        # packed_group_stride = group_size // 2
+        # a_base_ptrs = a_ptr + (offs_token[:, None] // top_k) * stride_am
+        # b_base_ptrs = b_ptr + off_experts * stride_be + offs_bn[None, :] * stride_bn
+
+        
+
+        ############################################################################
+        # prologue
+        ############################################################################
+        a = gl.load(a_ptrs,
+                    mask=token_mask_a[:, None] & (offs_ak[None, :] < K),
+                    other=0.0,)
+        b = gl.load(b_ptrs)
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += (BLOCK_SIZE_K) * stride_bk
+
+        b_unpacked = (b >> b_shifter) & 0xF
+
+        smem_a.store(a)
+        smem_b_int8.store(b_unpacked)
+
+        ############################################################################
+        # main loop
+        ############################################################################
+
+        num_k_iter = gl.cdiv(K, BLOCK_SIZE_K)
+        for k in range(0, num_k_iter - 1):
+            if not block_k_diviable:
+                k_mask = offs_ak[:, None] < K - k * BLOCK_SIZE_K
+                k_other = 0.0
+            else:
+                k_mask = None
+                k_other = None
+
+            a = gl.load(
+                a_ptrs,
+                mask=token_mask_a[:, None] & (offs_ak[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = gl.load(b_ptrs)
+            b_scale = gl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+
+            b_unpacked = (b >> b_shifter) & 0xF
+
+            # load b from shared memory
+            b_int8_converted = smem_b_int8.load(layout=b_int8_wmma_layout)
+            # load a from shared memory
+            a_converted = smem_a.load(layout=a_wmma_layout)
+
+            if enable_int4_fp16_dequant and use_int4_w4a16:
+                b_scale = b_scale.to(tl.float16)
+            else:
+                b_scale = b_scale.to(tl.float32)
+
+            # reshape
+            b_scale = gl.reshape(b_scale, (BLOCK_SIZE_K // group_size, 1, BLOCK_SIZE_N))
+
+            # if has_zp and use_int4_w4a16:
+            #     offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            #     b_zp_ptrs = (
+            #         b_zp_ptr
+            #         + off_experts * stride_bze
+            #         + (offs_bn[None, :] // 2) * stride_bzn
+            #         + offs_k_true * stride_bzk
+            #     )
+            #     b_zp = gl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            #     b_zp = (b_zp >> b_zp_shifter) & 0xF
+            #     if enable_int4_fp16_dequant:
+            #         b_zp = b_zp.to(gl.float16)
+            #     else:
+            #         b_zp = b_zp.to(gl.float32)
+            # elif has_zp and use_int8_w8a16:
+            #     offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            #     b_zp_ptrs = (
+            #         b_zp_ptr
+            #         + off_experts * stride_bze
+            #         + offs_bn[None, :] * stride_bzn
+            #         + offs_k_true * stride_bzk
+            #     )
+            #     b_zp = gl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            #     b_zp = b_zp.to(gl.float32)
+
+            if has_zp:
+                if enable_int4_fp16_dequant and use_int4_w4a16:
+                    b_fp_part = ((b_int8_converted.to(gl.float16) - b_zp))
+                else:
+                    b_fp_part = ((b_int8_converted.to(gl.float32) - b_zp))
+            else:
+                if enable_int4_fp16_dequant and use_int4_w4a16:
+                    b_fp_part = ((b_int8_converted.to(gl.float16) - b_zp_num))
+                else:
+                    b_fp_part = ((b_int8_converted.to(gl.float32) - b_zp_num))
+
+            b_fp_part = gl.reshape(b_fp_part, (BLOCK_SIZE_K // group_size, group_size, BLOCK_SIZE_N))
+            bs_converted = gl.convert_layout(b_scale, b_fp_part.type.layout)
+            b_fp = (b_fp_part * bs_converted).to(compute_type)
+
+            b_fp = gl.reshape(b_fp, (BLOCK_SIZE_K, BLOCK_SIZE_N))
+            
+
+            b_converted = gl.convert_layout(b_fp, b_wmma_layout)
+
+            smem_b_int8.store(b_unpacked)
+            smem_a.store(a)
+
+            accumulator = gl.amd.rdna3.wmma(a_converted, b_converted, acc=accumulator)
+
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            if use_int4_w4a16:
+                b_ptrs += (BLOCK_SIZE_K // PACK_B) * stride_bk
+                b_scale_ptrs += (BLOCK_SIZE_K // group_size) * stride_bsk
+            else:
+                b_ptrs += BLOCK_SIZE_K * stride_bk
+                b_scale_ptrs += BLOCK_SIZE_K * stride_bsk
+
+        ############################################################################
+        # epilogue
+        ############################################################################
+
+        b_scale = gl.load(b_scale_ptrs)
+
+        # load b from shared memory
+        b_int8_converted = smem_b_int8.load(layout=b_int8_wmma_layout)
+        # load a from shared memory
+        a_converted = smem_a.load(layout=a_wmma_layout)
+
+        # b_unpacked = (b_int8_converted >> b_shifter) & 0xF
+
+        if enable_int4_fp16_dequant and use_int4_w4a16:
+            b_fp_part = ((b_int8_converted.to(gl.float16) - b_zp_num))
+        else:
+            b_fp_part = ((b_int8_converted.to(gl.float32) - b_zp_num))
+
+        b_fp_part = gl.reshape(b_fp_part, (BLOCK_SIZE_K // group_size, group_size, BLOCK_SIZE_N))
+        b_scale = gl.reshape(b_scale, (BLOCK_SIZE_K // group_size, 1, BLOCK_SIZE_N))
+        bs_converted = gl.convert_layout(b_scale, b_fp_part.type.layout)
+        b_fp = (b_fp_part * bs_converted).to(compute_type)
+
+        b_fp = gl.reshape(b_fp, (BLOCK_SIZE_K, BLOCK_SIZE_N))
+
+        b_converted = gl.convert_layout(b_fp, b_wmma_layout)
+
+        accumulator = accumulator + gl.amd.rdna3.wmma(a_converted, b_converted, acc=accumulator)
+
+
+        if MUL_ROUTED_WEIGHT:
+            moe_weight = gl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+            accumulator = accumulator * moe_weight[:, None]
+
+        accumulator = accumulator.to(compute_type)
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        gl.store(c_ptrs, accumulator, mask=c_mask)
+
+else:
+    fused_moe_kernel_gptq_awq_gluon = None
+
+
 # NOTE(zyongye): we can remove all the wna16 kernel
 # once we drop off sm75 support
 def invoke_fused_moe_wna16_cuda_kernel(
@@ -798,6 +1199,266 @@ def invoke_fused_moe_wna16_triton_kernel(
     )
 
 
+def _is_env_true(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _get_moe_wna16_backend(use_int4_w4a16: bool) -> tuple[str, bool]:
+    """Return selected backend and whether it is explicitly forced."""
+    backend = os.getenv("VLLM_MOE_WNA16_BACKEND", "auto").strip().lower()
+    forced = backend in ("triton", "gluon")
+    if backend not in ("auto", "triton", "gluon"):
+        logger.warning(
+            "Unknown VLLM_MOE_WNA16_BACKEND=%s, fallback to auto.",
+            backend,
+        )
+        backend = "auto"
+        forced = False
+    # Backward compatibility: old switch maps to forcing gluon.
+    if backend == "auto" and use_int4_w4a16 and _is_env_true("VLLM_MOE_INT4_USE_GLUON", "0"):
+        backend = "gluon"
+        forced = True
+    return backend, forced
+
+
+def _to_gluon_compute_type(compute_type: tl.dtype):
+    if gl is None:
+        raise RuntimeError("Gluon is unavailable.")
+    if compute_type == tl.bfloat16:
+        return gl.bfloat16
+    if compute_type == tl.float16:
+        return gl.float16
+    if compute_type == tl.float32:
+        return gl.float32
+    raise ValueError(f"Unsupported Gluon compute_type: {compute_type}")
+
+
+def should_moe_wna16_use_gluon(use_int4_w4a16: bool) -> bool:
+    backend, _ = _get_moe_wna16_backend(use_int4_w4a16)
+    return use_int4_w4a16 and backend == "gluon"
+
+
+def invoke_fused_moe_wna16_gluon_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    B_scale: torch.Tensor | None,
+    B_zp: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    compute_type: tl.dtype,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    block_shape: list[int] | None,
+) -> None:
+    assert B_scale is not None and B_scale.ndim == 3
+    assert B_zp is None or B_zp.ndim == 3
+    assert block_shape is not None and block_shape[0] == 0
+    assert sorted_token_ids is not None
+    assert topk_weights is not None or not mul_routed_weight
+
+    if fused_moe_kernel_gptq_awq_gluon is None:
+        raise RuntimeError(
+            "Gluon fused_moe kernel is unavailable. "
+            "Install a Triton build with Gluon support or select "
+            "VLLM_MOE_WNA16_BACKEND=triton."
+        )
+
+    M = A.size(0)
+    num_tokens = M * top_k
+    EM = sorted_token_ids.size(0)
+    if A.size(0) < config["BLOCK_SIZE_M"]:
+        EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
+    grid = lambda META: (
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
+    )
+
+    config = config.copy()
+    config.update(
+        get_moe_wna16_block_config(
+            config=config,
+            use_moe_wna16_cuda=False,
+            num_valid_tokens=num_tokens,
+            size_k=A.size(1),
+            size_n=B.size(1),
+            num_experts=B.size(1),
+            group_size=block_shape[1],
+            real_top_k=top_k,
+            block_size_m=config["BLOCK_SIZE_M"],
+        )
+    )
+    enable_grouped_scale_fast_path = _is_env_true(
+        "VLLM_MOE_INT4_GROUPED_SCALE_FAST_PATH", "1"
+    )
+    enable_int4_fp16_dequant = _is_env_true("VLLM_MOE_INT4_DEQUANT_FP16", "0")
+    gluon_compute_type = _to_gluon_compute_type(compute_type)
+
+    fused_moe_kernel_gptq_awq_gluon[grid](
+        A,
+        B,
+        C,
+        B_scale,
+        B_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        B.size(1),
+        A.size(1),
+        EM,
+        num_tokens,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        B_scale.stride(0),
+        B_scale.stride(2),
+        B_scale.stride(1),
+        B_zp.stride(0) if B_zp is not None else 0,
+        B_zp.stride(2) if B_zp is not None else 0,
+        B_zp.stride(1) if B_zp is not None else 0,
+        block_k_diviable=A.size(1) % config["BLOCK_SIZE_K"] == 0,
+        group_size=block_shape[1],
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=gluon_compute_type,
+        has_zp=B_zp is not None,
+        use_int4_w4a16=use_int4_w4a16,
+        use_int8_w8a16=use_int8_w8a16,
+        enable_grouped_scale_fast_path=enable_grouped_scale_fast_path,
+        enable_int4_fp16_dequant=enable_int4_fp16_dequant,
+        **config,
+    )
+
+
+def invoke_fused_moe_wna16_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    B_scale: torch.Tensor | None,
+    B_zp: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    compute_type: tl.dtype,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    block_shape: list[int] | None,
+) -> None:
+    assert block_shape is not None and block_shape[0] == 0
+    assert sorted_token_ids is not None
+    num_tokens = A.size(0) * top_k
+
+    backend, backend_forced = _get_moe_wna16_backend(use_int4_w4a16)
+
+    if backend == "gluon":
+        if fused_moe_kernel_gptq_awq_gluon is None:
+            msg = (
+                "Selected Gluon backend but Gluon fused_moe kernel is unavailable. "
+                "Install a Triton build with triton.experimental.gluon support."
+            )
+            if backend_forced:
+                raise RuntimeError(msg)
+            logger.warning("%s Falling back to Triton/CUDA backend.", msg)
+        else:
+            invoke_fused_moe_wna16_gluon_kernel(
+                A,
+                B,
+                C,
+                B_scale,
+                B_zp,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                top_k,
+                config,
+                compute_type=compute_type,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                block_shape=block_shape,
+            )
+            return
+
+    if backend == "triton":
+        invoke_fused_moe_wna16_triton_kernel(
+            A,
+            B,
+            C,
+            B_scale,
+            B_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            top_k,
+            config,
+            compute_type,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            block_shape,
+        )
+        return
+
+    use_moe_wna16_cuda = should_moe_wna16_use_cuda(
+        num_valid_tokens=num_tokens,
+        group_size=block_shape[1],
+        num_experts=B.size(0),
+        bit=4 if use_int4_w4a16 else 8,
+    )
+    if use_moe_wna16_cuda:
+        invoke_fused_moe_wna16_cuda_kernel(
+            A,
+            B,
+            C,
+            B_scale,
+            B_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            top_k,
+            config,
+            block_shape,
+        )
+        return
+
+    invoke_fused_moe_wna16_triton_kernel(
+        A,
+        B,
+        C,
+        B_scale,
+        B_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        mul_routed_weight,
+        top_k,
+        config,
+        compute_type,
+        use_int8_w8a16,
+        use_int4_w4a16,
+        block_shape,
+    )
+
+
 def invoke_fused_moe_triton_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -944,31 +1605,7 @@ def dispatch_fused_moe_kernel(
     ):
         assert B_bias is None
 
-        use_moe_wna16_cuda = should_moe_wna16_use_cuda(
-            num_valid_tokens=num_tokens,
-            group_size=block_shape[1],
-            num_experts=B.size(0),
-            bit=4 if use_int4_w4a16 else 8,
-        )
-
-        if use_moe_wna16_cuda:
-            invoke_fused_moe_wna16_cuda_kernel(
-                A,
-                B,
-                C,
-                B_scale,
-                B_zp,
-                topk_weights,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                mul_routed_weight,
-                top_k,
-                config,
-                block_shape,
-            )
-            return
-        invoke_fused_moe_wna16_triton_kernel(
+        invoke_fused_moe_wna16_kernel(
             A,
             B,
             C,
@@ -981,11 +1618,12 @@ def dispatch_fused_moe_kernel(
             mul_routed_weight,
             top_k,
             config,
-            compute_type,
-            use_int8_w8a16,
-            use_int4_w4a16,
-            block_shape,
+            compute_type=compute_type,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            block_shape=block_shape,
         )
+        return
 
     else:
         invoke_fused_moe_triton_kernel(
@@ -2332,7 +2970,7 @@ class TritonWNA16Experts(TritonExperts):
             topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
 
-        invoke_fused_moe_wna16_triton_kernel(
+        invoke_fused_moe_wna16_kernel(
             hidden_states,
             w1,
             intermediate_cache1,
@@ -2365,7 +3003,7 @@ class TritonWNA16Experts(TritonExperts):
             self.block_shape,
         )
 
-        invoke_fused_moe_wna16_triton_kernel(
+        invoke_fused_moe_wna16_kernel(
             qintermediate_cache2,
             w2,
             intermediate_cache3,
