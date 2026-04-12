@@ -739,22 +739,22 @@ if _HAS_GLUON_W4A16:
 
         blocked_a: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 8],
-            threads_per_warp=[2, 16],
-            warps_per_cta=[2, 1],
+            threads_per_warp=[16, 2],
+            warps_per_cta=[1, 2],
             order=[1, 0],
         )
 
         blocked_b: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[8, 1],
             threads_per_warp=[1, 32],
-            warps_per_cta=[1, 2],
+            warps_per_cta=[2, 1],
             order=[0, 1],
         )
 
         blocked_bs: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 1],
             threads_per_warp=[1, 32],
-            warps_per_cta=[1, 2],
+            warps_per_cta=[2, 1],
             order=[0, 1],
         )
 
