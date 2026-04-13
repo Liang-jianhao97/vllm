@@ -143,6 +143,7 @@ def fused_moe_kernel_gptq_awq(
     use_int8_w8a16: tl.constexpr,
     enable_grouped_scale_fast_path: tl.constexpr,
     enable_int4_fp16_dequant: tl.constexpr,
+    USE_GEMV: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -314,7 +315,14 @@ def fused_moe_kernel_gptq_awq(
                     b_chunk = (
                         (b_chunk.to(tl.float32) - b_zp_num) * b_scale_row[None, :]
                     ).to(compute_type)
-                accumulator = tl.dot(a_chunk, b_chunk, acc=accumulator)
+                if USE_GEMV:
+                    _a = tl.trans(a_chunk).to(compute_type)
+                    _product = _a * b_chunk
+                    accumulator = accumulator + tl.expand_dims(
+                        tl.sum(_product, axis=0), 0
+                    )
+                else:
+                    accumulator = tl.dot(a_chunk, b_chunk, acc=accumulator)
         else:
             a = tl.load(
                 a_ptrs,
@@ -373,7 +381,14 @@ def fused_moe_kernel_gptq_awq(
                     b = ((b.to(tl.float16) - b_zp_num) * b_scale).to(compute_type)
                 else:
                     b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-            accumulator = tl.dot(a, b, acc=accumulator)
+            if USE_GEMV:
+                _a = tl.trans(a).to(compute_type)
+                _product = _a * b
+                accumulator = accumulator + tl.expand_dims(
+                    tl.sum(_product, axis=0), 0
+                )
+            else:
+                accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -1003,6 +1018,11 @@ if _HAS_GLUON_W4A16:
 
         b_scale = gl.load(b_scale_ptrs)
 
+        if enable_int4_fp16_dequant and use_int4_w4a16:
+            b_scale = b_scale.to(tl.float16)
+        else:
+            b_scale = b_scale.to(tl.float32)
+
         # load b from shared memory
         b_int8_converted = smem_b_int8.load(layout=b_int8_wmma_layout)
         # load a from shared memory
@@ -1037,8 +1057,257 @@ if _HAS_GLUON_W4A16:
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         gl.store(c_ptrs, accumulator, mask=c_mask)
 
+    @gluon.jit
+    def fused_moe_kernel_gemv_gluon(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        b_scale_ptr,
+        b_zp_ptr,
+        topk_weights_ptr,
+        sorted_token_ids_ptr,
+        expert_ids_ptr,
+        num_tokens_post_padded_ptr,
+        N: gl.constexpr,
+        K: gl.constexpr,
+        EM,
+        num_valid_tokens,
+        stride_am,
+        stride_ak,
+        stride_be,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        stride_bse,
+        stride_bsk,
+        stride_bsn,
+        stride_bze,
+        stride_bzk,
+        stride_bzn,
+        block_k_diviable: gl.constexpr,
+        group_size: gl.constexpr,
+        BLOCK_SIZE_N: gl.constexpr,
+        BLOCK_SIZE_K: gl.constexpr,
+        MUL_ROUTED_WEIGHT: gl.constexpr,
+        top_k: gl.constexpr,
+        compute_type: gl.constexpr,
+        has_zp: gl.constexpr,
+        use_int4_w4a16: gl.constexpr,
+        use_int8_w8a16: gl.constexpr,
+        enable_int4_fp16_dequant: gl.constexpr,
+    ):
+        """GEMV kernel for M=1 decode: no LDS, no WMMA, thread-local K reduction.
+
+        Layout design (4 warps × 32 threads = 128 threads):
+          blocked_b_gemv: spt=[K, 1], tpw=[1, 32], wpc=[1, 4]
+            → each thread owns ALL K elements for 1 N position
+            → tl.sum(axis=0) is purely thread-local (no LDS round-trip)
+          BLOCK_SIZE_N = 128 is forced by the 128-thread layout constraint.
+        """
+        PACK_B: gl.constexpr = 2
+
+        # B load layout: each thread owns [BLOCK_SIZE_K, 1] — all K, 1 N
+        # 4 warps × 32 threads = 128 threads → BLOCK_SIZE_N = 128
+        blocked_b_gemv: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[BLOCK_SIZE_K, 1],
+            threads_per_warp=[1, 32],
+            warps_per_cta=[1, 4],
+            order=[0, 1],
+        )
+
+        # Scale layout: [K_groups, N] with K_groups per thread
+        blocked_bs_gemv: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[BLOCK_SIZE_K // group_size, 1],
+            threads_per_warp=[1, 32],
+            warps_per_cta=[1, 4],
+            order=[0, 1],
+        )
+
+        # Accumulator / output layout: [1, N]
+        # 1D layout for accumulator / output: [N]
+        # Derived from blocked_b_gemv by removing dim 0 (K).
+        acc_layout: gl.constexpr = gl.SliceLayout(0, blocked_b_gemv)
+
+        ####################################################################
+        # grid mapping:  pid = pid_m * num_pid_n + pid_n
+        ####################################################################
+        pid = gl.program_id(axis=0)
+        num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+
+        num_tokens_post_padded = gl.load(num_tokens_post_padded_ptr)
+        if pid_m >= num_tokens_post_padded:
+            return
+
+        offs_token = gl.load(sorted_token_ids_ptr + pid_m).to(gl.int64)
+        if offs_token >= num_valid_tokens:
+            return
+
+        off_experts = gl.load(expert_ids_ptr + pid_m).to(gl.int64)
+        if off_experts == -1:
+            offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+                0, BLOCK_SIZE_N, layout=acc_layout
+            )
+            zeros = gl.zeros(
+                (BLOCK_SIZE_N,), dtype=compute_type, layout=acc_layout
+            )
+            c_ptrs = c_ptr + stride_cm * offs_token + stride_cn * offs_cn
+            c_mask = offs_cn < N
+            gl.store(c_ptrs, zeros, mask=c_mask)
+            return
+
+        ####################################################################
+        # pointer setup
+        ####################################################################
+
+        # B pointers: [BLOCK_SIZE_K, BLOCK_SIZE_N]
+        offs_bn = (
+            pid_n * BLOCK_SIZE_N
+            + gl.arange(
+                0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_b_gemv)
+            ).to(gl.int64)
+        ) % N
+        offs_bk = gl.arange(
+            0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_b_gemv)
+        )
+
+        if use_int4_w4a16:
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + (offs_bk[:, None] // PACK_B) * stride_bk
+                + offs_bn[None, :] * stride_bn
+            )
+            b_shifter = ((offs_bk[:, None] % 2) * 4).to(gl.int8)
+
+        # A pointers: [BLOCK_SIZE_K] — all threads load same row (broadcast via L1)
+        a_base = a_ptr + (offs_token // top_k) * stride_am
+        offs_ak = gl.arange(
+            0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_b_gemv)
+        )
+        a_ptrs = a_base + offs_ak * stride_ak
+
+        # Scale pointers: [K_groups, BLOCK_SIZE_N]
+        offs_bsk = gl.arange(
+            0,
+            BLOCK_SIZE_K // group_size,
+            layout=gl.SliceLayout(1, blocked_bs_gemv),
+        )
+        offs_bsn = pid_n * BLOCK_SIZE_N + gl.arange(
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_bs_gemv)
+        )
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bsn[None, :] * stride_bsn
+            + offs_bsk[:, None] * stride_bsk
+        )
+
+        if not has_zp and use_int4_w4a16:
+            b_zp_num = 8
+        if not has_zp and use_int8_w8a16:
+            b_zp_num = 128
+
+        ####################################################################
+        # accumulator (1D — same layout as tl.sum result, no conversion)
+        ####################################################################
+        accumulator = gl.zeros(
+            (BLOCK_SIZE_N,), dtype=gl.float32, layout=acc_layout
+        )
+
+        ####################################################################
+        # main K loop — no LDS, no barriers
+        ####################################################################
+        num_k_iter = gl.cdiv(K, BLOCK_SIZE_K)
+        for k in range(0, num_k_iter):
+            # Load A [BLOCK_SIZE_K] — redundant across threads, served from L1
+            if block_k_diviable:
+                a_vals = gl.load(a_ptrs)
+            else:
+                a_vals = gl.load(
+                    a_ptrs,
+                    mask=offs_ak < K - k * BLOCK_SIZE_K,
+                    other=0.0,
+                )
+
+            # Load B [BLOCK_SIZE_K, BLOCK_SIZE_N] INT8
+            b = gl.load(b_ptrs)
+            b_unpacked = (b >> b_shifter) & 0xF
+
+            # Load scale [K_groups, BLOCK_SIZE_N]
+            if block_k_diviable:
+                b_scale = gl.load(b_scale_ptrs)
+            else:
+                k_remaining = gl.cdiv(K - k * BLOCK_SIZE_K, group_size)
+                b_scale = gl.load(
+                    b_scale_ptrs,
+                    mask=offs_bsk[:, None] < k_remaining,
+                    other=0.0,
+                )
+
+            if enable_int4_fp16_dequant and use_int4_w4a16:
+                b_scale = b_scale.to(tl.float16)
+            else:
+                b_scale = b_scale.to(tl.float32)
+
+            # Dequant: INT4 → float
+            if has_zp:
+                if enable_int4_fp16_dequant and use_int4_w4a16:
+                    b_fp_part = b_unpacked.to(gl.float16) - b_zp
+                else:
+                    b_fp_part = b_unpacked.to(gl.float32) - b_zp
+            else:
+                if enable_int4_fp16_dequant and use_int4_w4a16:
+                    b_fp_part = b_unpacked.to(gl.float16) - b_zp_num
+                else:
+                    b_fp_part = b_unpacked.to(gl.float32) - b_zp_num
+
+            b_fp_part = gl.reshape(
+                b_fp_part,
+                (BLOCK_SIZE_K // group_size, group_size, BLOCK_SIZE_N),
+            )
+            b_scale = gl.reshape(
+                b_scale,
+                (BLOCK_SIZE_K // group_size, 1, BLOCK_SIZE_N),
+            )
+            bs_converted = gl.convert_layout(b_scale, b_fp_part.type.layout)
+            b_fp = (b_fp_part * bs_converted).to(compute_type)
+            b_fp = gl.reshape(b_fp, (BLOCK_SIZE_K, BLOCK_SIZE_N))
+
+            # GEMV core: a[K] × b[K, N] → partial [N]
+            a_col = a_vals[:, None].to(compute_type)
+            product = a_col * b_fp
+            partial = tl.sum(product, axis=0)
+            accumulator = accumulator + partial
+
+            # advance pointers
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            if use_int4_w4a16:
+                b_ptrs += (BLOCK_SIZE_K // PACK_B) * stride_bk
+            else:
+                b_ptrs += BLOCK_SIZE_K * stride_bk
+            b_scale_ptrs += (BLOCK_SIZE_K // group_size) * stride_bsk
+
+        ####################################################################
+        # epilogue: apply routed weight & store
+        ####################################################################
+        if MUL_ROUTED_WEIGHT:
+            moe_weight = gl.load(topk_weights_ptr + offs_token)
+            accumulator = accumulator * moe_weight
+
+        accumulator = accumulator.to(compute_type)
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+            0, BLOCK_SIZE_N, layout=acc_layout
+        )
+        c_ptrs = c_ptr + stride_cm * offs_token + stride_cn * offs_cn
+        c_mask = offs_cn < N
+        gl.store(c_ptrs, accumulator, mask=c_mask)
+
 else:
     fused_moe_kernel_gptq_awq_gluon = None
+    fused_moe_kernel_gemv_gluon = None
 
 
 # NOTE(zyongye): we can remove all the wna16 kernel
@@ -1158,6 +1427,11 @@ def invoke_fused_moe_wna16_triton_kernel(
         "VLLM_MOE_INT4_DEQUANT_FP16", "0"
     ).lower() in ("1", "true", "yes", "on")
 
+    gemv_threshold = int(os.getenv("VLLM_MOE_GEMV_THRESHOLD", "4"))
+    use_gemv = M <= gemv_threshold
+    if use_gemv:
+        config["BLOCK_SIZE_M"] = 1
+
     fused_moe_kernel_gptq_awq[grid](
         A,
         B,
@@ -1195,6 +1469,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         use_int8_w8a16=use_int8_w8a16,
         enable_grouped_scale_fast_path=enable_grouped_scale_fast_path,
         enable_int4_fp16_dequant=enable_int4_fp16_dequant,
+        USE_GEMV=use_gemv,
         **config,
     )
 
@@ -1271,6 +1546,38 @@ def invoke_fused_moe_wna16_gluon_kernel(
 
     M = A.size(0)
     num_tokens = M * top_k
+
+    gemv_threshold = int(os.getenv("VLLM_MOE_GEMV_THRESHOLD", "4"))
+    use_gemv = (
+      use_int4_w4a16
+      and not use_int8_w8a16
+      and B_zp is None
+      and M <= gemv_threshold
+      and block_shape[1] <= 64
+      and 64 % block_shape[1] == 0
+      and A.size(1) % 64 == 0
+    )
+    if use_gemv:
+        invoke_fused_moe_gemv_gluon(
+            A,
+            B,
+            C,
+            B_scale,
+            B_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            top_k,
+            compute_type=compute_type,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            block_shape=block_shape,
+        )
+        return
+
+
     EM = sorted_token_ids.size(0)
     if A.size(0) < config["BLOCK_SIZE_M"]:
         EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
@@ -1337,6 +1644,95 @@ def invoke_fused_moe_wna16_gluon_kernel(
         enable_grouped_scale_fast_path=enable_grouped_scale_fast_path,
         enable_int4_fp16_dequant=enable_int4_fp16_dequant,
         **config,
+    )
+
+
+def invoke_fused_moe_gemv_gluon(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    B_scale: torch.Tensor | None,
+    B_zp: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    compute_type: tl.dtype,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    block_shape: list[int] | None,
+) -> None:
+    """Invoke the Gluon GEMV kernel for M=1 decode.
+
+    This kernel avoids LDS and WMMA entirely: each thread owns all K elements
+    for a single N position, so the K-reduction is purely register-local.
+    BLOCK_SIZE_N is fixed to 128 (4 warps × 32 threads = 128 threads).
+    """
+    if fused_moe_kernel_gemv_gluon is None:
+        raise RuntimeError(
+            "Gluon GEMV kernel is unavailable. "
+            "Install a Triton build with Gluon support."
+        )
+
+    assert B_scale is not None and B_scale.ndim == 3
+    assert block_shape is not None and block_shape[0] == 0
+    assert sorted_token_ids is not None
+    assert topk_weights is not None or not mul_routed_weight
+
+    BLOCK_SIZE_K = 64
+    BLOCK_SIZE_N = 128
+
+    M = A.size(0)
+    num_tokens = M * top_k
+    EM = sorted_token_ids.size(0)
+
+    N = B.size(1)
+    num_n_blocks = triton.cdiv(N, BLOCK_SIZE_N)
+    grid = (EM * num_n_blocks,)
+
+    enable_int4_fp16_dequant = _is_env_true("VLLM_MOE_INT4_DEQUANT_FP16", "0")
+    gluon_compute_type = _to_gluon_compute_type(compute_type)
+
+    fused_moe_kernel_gemv_gluon[grid](
+        A,
+        B,
+        C,
+        B_scale,
+        B_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        A.size(1),
+        EM,
+        num_tokens,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        B_scale.stride(0),
+        B_scale.stride(2),
+        B_scale.stride(1),
+        B_zp.stride(0) if B_zp is not None else 0,
+        B_zp.stride(2) if B_zp is not None else 0,
+        B_zp.stride(1) if B_zp is not None else 0,
+        block_k_diviable=A.size(1) % BLOCK_SIZE_K == 0,
+        group_size=block_shape[1],
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=gluon_compute_type,
+        has_zp=B_zp is not None,
+        use_int4_w4a16=use_int4_w4a16,
+        use_int8_w8a16=use_int8_w8a16,
+        enable_int4_fp16_dequant=enable_int4_fp16_dequant,
     )
 
 
